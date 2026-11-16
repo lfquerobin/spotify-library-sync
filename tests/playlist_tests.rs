@@ -14,6 +14,7 @@ fn options(kind: Kind) -> Options {
         from: None,
         to: None,
         date_basis: DateBasis::Added,
+        include_compilations: false,
         name: None,
         public: false,
     }
@@ -58,6 +59,157 @@ async fn track(
         .bind(id)
         .execute(db)
         .await?;
+    Ok(())
+}
+
+async fn release_catalog(db: &mut SqliteConnection) -> Result<()> {
+    database::artist(db, &json!({"id":"followed"})).await?;
+    database::artist(db, &json!({"id":"stranger"})).await?;
+    sqlx::query("INSERT INTO artista_seguido VALUES('followed',1,'scan','2026-01-01')")
+        .execute(&mut *db)
+        .await?;
+    sqlx::query("INSERT INTO discografia_job(id,kind,status,phase,options_json,catalog_context,album_context,request_limit,started_at,updated_at,completed_at) VALUES('scan','sync','completed','completed','{}','catalog','context',200,'2026-01-01','2026-01-01','2026-01-01')").execute(&mut *db).await?;
+    sqlx::query("INSERT INTO discografia_cache VALUES('followed','catalog','2026-01-01','2026-01-01','full','scan',0)").execute(db).await?;
+    Ok(())
+}
+
+async fn release(
+    db: &mut SqliteConnection,
+    id: &str,
+    date: &str,
+    group: &str,
+    credit: &str,
+) -> Result<()> {
+    album(db, id, false, "", date).await?;
+    database::track(
+        db,
+        &json!({"id":id,"name":id,"uri":format!("spotify:track:{id}"),"artists":[{"id":credit}]}),
+        id,
+    )
+    .await?;
+    sqlx::query("INSERT INTO artista_lancamento VALUES('followed',?,'catalog','context','album,single,appears_on,compilation',?,'2026-01-01','2026-01-01','scan')").bind(id).bind(group).execute(&mut *db).await?;
+    sqlx::query("INSERT INTO discografia_album_queue(album_id,album_context,state) VALUES(?,'context','completed')").bind(id).execute(&mut *db).await?;
+    sqlx::query("INSERT INTO discografia_album_position VALUES(?,'context',0,?)")
+        .bind(id)
+        .bind(id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn usfa_matches_release_period_compilation_choice_and_followed_track_credits() -> Result<()> {
+    let (_dir, mut db) = setup().await?;
+    release_catalog(&mut db).await?;
+    for (id, date, group, credit) in [
+        ("regular", "2026-02-28", "album", "followed"),
+        ("collab", "2026-02", "appears_on", "followed"),
+        ("groupCompilation", "2026-02-20", "compilation", "followed"),
+        ("typeCompilation", "2026-02-20", "appears_on", "followed"),
+        ("uncredited", "2026-02-20", "album", "stranger"),
+        ("liked", "2026-02-20", "album", "followed"),
+        ("old", "2025", "album", "followed"),
+        ("undated", "", "album", "followed"),
+    ] {
+        release(&mut db, id, date, group, credit).await?;
+    }
+    sqlx::query("UPDATE album SET album_type='compilation' WHERE id='typeCompilation'")
+        .execute(&mut db)
+        .await?;
+    sqlx::query("UPDATE musica SET is_saved=1 WHERE id='liked'")
+        .execute(&mut db)
+        .await?;
+    let mut opts = options(Kind::Usfa);
+    opts.date_basis = DateBasis::Release;
+    opts.from = Some("02/2026".into());
+    let preview = playlist::preview(&mut db, &opts).await?;
+    assert_eq!(preview.name, "USFA - 02-2026");
+    assert_eq!(
+        preview
+            .candidates
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect::<Vec<_>>(),
+        ["regular", "collab"]
+    );
+    opts.include_compilations = true;
+    assert_eq!(playlist::preview(&mut db, &opts).await?.count, 4);
+    opts.from = None;
+    assert_eq!(playlist::preview(&mut db, &opts).await?.count, 5);
+    sqlx::query("UPDATE artista_seguido SET is_followed=0")
+        .execute(&mut db)
+        .await?;
+    assert_eq!(playlist::preview(&mut db, &opts).await?.count, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn usfa_deduplicates_recordings_and_uses_only_current_catalog_positions() -> Result<()> {
+    let (_dir, mut db) = setup().await?;
+    release_catalog(&mut db).await?;
+    release(&mut db, "first", "2026-02-20", "album", "followed").await?;
+    release(&mut db, "edition", "2026-02-01", "album", "followed").await?;
+    sqlx::query("UPDATE musica SET isrc='recording'")
+        .execute(&mut db)
+        .await?;
+    let mut opts = options(Kind::Usfa);
+    opts.date_basis = DateBasis::Release;
+    let preview = playlist::preview(&mut db, &opts).await?;
+    assert_eq!(preview.count, 1);
+    assert_eq!(preview.candidates[0].id, "first");
+    // Catalog links alone must not reintroduce stale album-track associations.
+    sqlx::query("DELETE FROM discografia_album_position")
+        .execute(&mut db)
+        .await?;
+    assert_eq!(playlist::preview(&mut db, &opts).await?.count, 0);
+    sqlx::query("INSERT INTO discografia_album_queue(album_id,album_context,state) VALUES('first','otherMarket','completed')").execute(&mut db).await?;
+    sqlx::query("INSERT INTO discografia_album_position VALUES('first','otherMarket',0,'first')")
+        .execute(&mut db)
+        .await?;
+    assert_eq!(playlist::preview(&mut db, &opts).await?.count, 0);
+    sqlx::query("INSERT INTO discografia_job(id,kind,status,phase,options_json,catalog_context,album_context,request_limit,started_at,updated_at) VALUES('newScan','sync','running','artists','{}','newCatalog','newMarket',200,'2026-02-01','2026-02-01')").execute(&mut db).await?;
+    let preview = playlist::preview(&mut db, &opts).await?;
+    assert_eq!(preview.count, 0);
+    assert!(preview.incomplete);
+    Ok(())
+}
+
+#[tokio::test]
+async fn usfa_validates_date_basis_and_reports_missing_or_partial_discography() -> Result<()> {
+    let (_dir, mut db) = setup().await?;
+    let mut opts = options(Kind::Usfa);
+    assert!(playlist::preview(&mut db, &opts).await.is_err());
+    opts.date_basis = DateBasis::Release;
+    let preview = playlist::preview(&mut db, &opts).await?;
+    assert!(preview.incomplete);
+    assert!(preview
+        .warnings
+        .iter()
+        .any(|w| w.contains("ainda não importadas")));
+    release_catalog(&mut db).await?;
+    release(&mut db, "release", "2026", "single", "followed").await?;
+    sqlx::query("UPDATE library_sync_state SET initial_import_completed_at='2026-01-01'")
+        .execute(&mut db)
+        .await?;
+    assert!(!playlist::preview(&mut db, &opts).await?.incomplete);
+    sqlx::query("UPDATE discografia_album_queue SET state='pending'")
+        .execute(&mut db)
+        .await?;
+    let preview = playlist::preview(&mut db, &opts).await?;
+    assert!(preview.incomplete);
+    assert!(preview
+        .warnings
+        .iter()
+        .any(|w| w.contains("1 lançamentos com faixas incompletas")));
+    let job = playlist::freeze(&mut db, &opts, &preview).await?;
+    let mut api = Mock::default();
+    let result = playlist::run(&mut db, &mut api, &job).await?;
+    assert_eq!(result["tracks"], 1);
+    assert_eq!(api.remote, ["spotify:track:release"]);
+    let legacy: Options = serde_json::from_value(
+        json!({"kind":"lsua","from":null,"to":null,"date_basis":"added","name":null,"public":false}),
+    )?;
+    assert!(!legacy.include_compilations);
     Ok(())
 }
 #[tokio::test]

@@ -18,12 +18,14 @@ use std::collections::HashSet;
 pub enum Kind {
     Lsua,
     Ussa,
+    Usfa,
 }
 impl Kind {
     pub fn prefix(self) -> &'static str {
         match self {
             Self::Lsua => "LSUA",
             Self::Ussa => "USSA",
+            Self::Usfa => "USFA",
         }
     }
 }
@@ -43,8 +45,17 @@ pub struct Options {
     pub from: Option<String>,
     #[arg(long)]
     pub to: Option<String>,
-    #[arg(long, value_enum, default_value = "added")]
+    #[arg(
+        long,
+        value_enum,
+        default_value = "added",
+        default_value_if("kind", "usfa", "release")
+    )]
     pub date_basis: DateBasis,
+    /// Incluir compilações na USFA (desativado por padrão).
+    #[arg(long)]
+    #[serde(default)]
+    pub include_compilations: bool,
     #[arg(long)]
     pub name: Option<String>,
     #[arg(long)]
@@ -107,6 +118,12 @@ fn date_interval(value: &str) -> Result<(String, String)> {
 }
 impl Options {
     fn bounds(&self) -> Result<(Option<String>, Option<String>)> {
+        if self.kind == Kind::Usfa && self.date_basis != DateBasis::Release {
+            bail!("USFA usa a data de lançamento; informe --date-basis release");
+        }
+        if self.kind != Kind::Usfa && self.include_compilations {
+            bail!("--include-compilations está disponível somente para USFA");
+        }
         let low = self
             .from
             .as_deref()
@@ -148,13 +165,51 @@ pub async fn preview(db: &mut SqliteConnection, options: &Options) -> Result<Pre
     let sql=match options.kind {
         Kind::Lsua=>"SELECT m.id,m.name,m.spotify_uri,m.is_local,m.is_playable,m.saved_at,a.release_date FROM musica m JOIN album a ON a.id=m.album_id WHERE m.is_saved=1 AND a.is_saved=0 ORDER BY m.saved_at DESC,m.id",
         Kind::Ussa=>"SELECT m.id,m.name,m.spotify_uri,m.is_local,m.is_playable,a.saved_at,a.release_date FROM album a JOIN album_musica am ON am.album_id=a.id JOIN musica m ON m.id=am.musica_id WHERE a.is_saved=1 AND m.is_saved=0 ORDER BY a.saved_at DESC,a.id,am.disc_number,am.track_number,m.id",
+        // Positions belong to the release's market context; album_musica can retain old links.
+        Kind::Usfa => r#"
+            SELECT m.id,m.name,m.spotify_uri,m.is_local,m.is_playable,m.isrc,m.raw_json,
+                   a.saved_at,a.release_date,a.album_type,
+                   EXISTS(SELECT 1 FROM artista_lancamento c
+                          WHERE c.album_id=a.id AND c.catalog_context=l.catalog_context
+                            AND c.album_group='compilation') AS compilation_group
+            FROM artista_lancamento l
+            JOIN artista_seguido f ON f.artista_id=l.artista_id AND f.is_followed=1
+            JOIN album a ON a.id=l.album_id
+            JOIN discografia_album_position p ON p.album_id=a.id AND p.album_context=l.album_context
+            JOIN musica m ON m.id=p.musica_id
+            WHERE l.catalog_context=(SELECT catalog_context FROM discografia_job
+                                     WHERE catalog_context IS NOT NULL
+                                     ORDER BY started_at DESC,id DESC LIMIT 1)
+              AND m.is_saved=0
+              AND EXISTS(SELECT 1 FROM musica_artista ma
+                         JOIN artista_seguido followed ON followed.artista_id=ma.artista_id
+                                                     AND followed.is_followed=1
+                         WHERE ma.musica_id=m.id)
+            ORDER BY substr(a.release_date||'-01-01',1,10) DESC,a.id,p.position,m.id
+        "#,
     };
     let rows = sqlx::query(sql).fetch_all(&mut *tx).await?;
     let mut ids = HashSet::new();
     let mut uris = HashSet::new();
+    let mut recordings = HashSet::new();
     let mut candidates = Vec::new();
     let mut excluded = 0;
     for row in rows {
+        if options.kind == Kind::Usfa {
+            if !options.include_compilations
+                && (row.get::<Option<String>, _>("album_type").as_deref() == Some("compilation")
+                    || row.get::<i64, _>("compilation_group") != 0)
+            {
+                continue;
+            }
+            // USFA needs a valid release date even for an unbounded period.
+            if !row
+                .get::<Option<String>, _>("release_date")
+                .is_some_and(|date| date_interval(&date).is_ok())
+            {
+                continue;
+            }
+        }
         if low.is_some() || high.is_some() {
             let value: Option<String> = row.get(if options.date_basis == DateBasis::Added {
                 "saved_at"
@@ -189,9 +244,29 @@ pub async fn preview(db: &mut SqliteConnection, options: &Options) -> Result<Pre
             excluded += 1;
             continue;
         }
-        if !ids.contains(&id) && !uris.contains(&uri) {
+        let recording = if options.kind == Kind::Usfa {
+            if uri.strip_prefix("spotify:track:") != Some(id.as_str()) {
+                excluded += 1;
+                continue;
+            }
+            let raw: Value = serde_json::from_str(row.get("raw_json"))?;
+            row.get::<Option<String>, _>("isrc")
+                .filter(|isrc| !isrc.is_empty())
+                .map(|isrc| format!("isrc:{isrc}"))
+                .or_else(|| {
+                    raw.pointer("/linked_from/uri")
+                        .and_then(Value::as_str)
+                        .filter(|uri| !uri.is_empty())
+                        .map(|uri| format!("linked:{uri}"))
+                })
+                .unwrap_or_else(|| uri.clone())
+        } else {
+            uri.clone()
+        };
+        if !ids.contains(&id) && !uris.contains(&uri) && !recordings.contains(&recording) {
             ids.insert(id.clone());
             uris.insert(uri.clone());
+            recordings.insert(recording);
             candidates.push(Candidate {
                 id,
                 uri,
@@ -214,6 +289,26 @@ pub async fn preview(db: &mut SqliteConnection, options: &Options) -> Result<Pre
         if pending > 0 {
             warnings.push(format!("{pending} álbuns salvos com faixas incompletas; somente as faixas já cadastradas poderão entrar."));
         }
+    }
+    if options.kind == Kind::Usfa {
+        let latest = sqlx::query("SELECT catalog_context,started_at,completed_at,status FROM discografia_job WHERE catalog_context IS NOT NULL ORDER BY started_at DESC,id DESC LIMIT 1")
+            .fetch_optional(&mut *tx).await?;
+        if let Some(job) = latest {
+            let catalog: String = job.get("catalog_context");
+            let pending: i64 = sqlx::query_scalar("SELECT COUNT(DISTINCT l.album_id) FROM artista_lancamento l JOIN artista_seguido f ON f.artista_id=l.artista_id AND f.is_followed=1 LEFT JOIN discografia_album_queue q ON q.album_id=l.album_id AND q.album_context=l.album_context WHERE l.catalog_context=? AND (q.state IS NULL OR q.state<>'completed')")
+                .bind(&catalog).fetch_one(&mut *tx).await?;
+            let missing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM artista_seguido f LEFT JOIN discografia_cache c ON c.artista_id=f.artista_id AND c.catalog_context=? WHERE f.is_followed=1 AND (c.last_full_at IS NULL OR c.needs_full_refresh=1)")
+                .bind(&catalog).fetch_one(&mut *tx).await?;
+            incomplete |=
+                pending > 0 || missing > 0 || job.get::<String, _>("status") != "completed";
+            warnings.push(format!("Discografias: última execução {}; conclusão {}; {missing} artistas sem catálogo completo neste contexto; {pending} lançamentos com faixas incompletas. Atualize separadamente com discography sync / discography tracks.", job.get::<String,_>("started_at"), job.get::<Option<String>,_>("completed_at").unwrap_or_else(|| "pendente".into())));
+        } else {
+            incomplete = true;
+            warnings.push(
+                "Discografias ainda não importadas; execute discography sync separadamente.".into(),
+            );
+        }
+        warnings.push("USFA usa somente o contexto mais recente de discografias e os artistas atualmente seguidos na base local. Curtidas e artistas seguidos não são conferidos ao vivo.".into());
     }
     let running: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM sync_job WHERE status<>'completed'")

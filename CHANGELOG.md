@@ -2,6 +2,9 @@
 
 ## Próxima versão
 
+- Nova playlist USFA no menu (opção 13) e CLI (`--kind usfa`): lançamentos não curtidos de artistas seguidos, período por data de lançamento e `--include-compilations` opcional, desativado por padrão, seguindo os parâmetros do Spotifast.
+- Seleção USFA local por contexto de discografias e créditos das faixas, deduplicação de gravações, aviso de importação parcial e reutilização da criação/retomada de playlists.
+
 - Orçamento da discografia configurável no `.env` por `SPOTIFY_DISCOGRAPHY_REQUEST_BUDGET`, aplicado ao menu e comandos com prioridade para `--request-budget`.
 
 - Discografias usam o cursor de `next` em páginas curtas, validam a paginação por posição e recuperam checkpoints antigos; erros incluem detalhes da resposta.

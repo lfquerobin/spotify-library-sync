@@ -167,8 +167,13 @@ Execute `spotify-sync` sem argumentos para abrir o menu interativo. No Windows, 
 |---|---|---|
 | LSUA | Músicas curtidas cujo álbum principal não está salvo. | `LSUA - {período}` |
 | USSA | Faixas não curtidas vinculadas a pelo menos um álbum salvo. | `USSA - {período}` |
+| USFA | Lançamentos de artistas seguidos, com faixas não curtidas que creditem um artista seguido. | `USFA - {período}` |
 
-**A seleção usa exclusivamente o SQLite.** Criar uma playlist não sincroniza a biblioteca, não consulta `contains`, não baixa metadados e não percorre artistas ou álbuns no Spotify. Dados ausentes não são buscados automaticamente. Faixas locais, explicitamente indisponíveis ou sem URI válida são excluídas; a seleção é deduplicada por identidade e URI. Não há agrupamento de gravações distintas por nome ou ISRC.
+**A seleção usa exclusivamente o SQLite.** Criar uma playlist não sincroniza a biblioteca, não consulta `contains`, não baixa metadados e não percorre artistas ou álbuns no Spotify. Dados ausentes não são buscados automaticamente. Faixas locais, explicitamente indisponíveis ou sem URI válida são excluídas; a seleção é deduplicada por identidade e URI. Na USFA, assim como no Spotifast, também se deduplica por ISRC ou, quando ausente, pela URI de `linked_from`. LSUA/USSA mantêm a deduplicação por identidade e URI.
+
+A opção **13 — Criar USFA** reproduz os parâmetros de [USFA no Spotifast](https://github.com/lfquerobin/spotifast/blob/main/docs/_reference/playlist-generation.md): período por ano, mês ou dia, intervalo inclusivo ou sem limite; nome editável; visibilidade; **incluir compilações desativado por padrão**. A referência é sempre o lançamento da edição do álbum, inclusive reedições; `--date-basis added` é rejeitado. Álbuns regulares em `appears_on` continuam elegíveis, mas compilações identificadas por tipo ou grupo são excluídas até marcar a opção. O álbum estar salvo não interfere. As músicas são ordenadas por lançamento mais recente e posição no álbum.
+
+A USFA usa os lançamentos e as posições de faixas do contexto mais recente de discografias (mercado/grupos), e somente artistas marcados como seguidos na base local. Faixas de outros artistas no mesmo álbum são excluídas se não creditarem um seguido. Sem período, entram todos os lançamentos conhecidos com data válida. A prévia informa a última execução de discografias, artistas sem catálogo completo e lançamentos com faixas pendentes. Uma seleção parcial exige confirmação ou `--allow-incomplete`. Para atualizar os dados antes, execute `sync`, `discography sync` e, se necessário, `discography tracks` separadamente. A cobertura depende dos grupos e artistas já importados; a criação não amplia essa cobertura. Diferentemente da consulta ao vivo do Spotifast, curtidas e artistas seguidos refletem o SQLite.
 
 O menu pede período, referência da data, nome e visibilidade. Aceita ano (`2026`), mês/ano (`02/2026`), data (`05/02/2026`) ou intervalo inclusivo; os comandos também aceitam datas ISO. Um único período abrange o ano, mês ou dia inteiro. Sem período, o sufixo é `All`. Os demais nomes seguem o Spotifast: `LSUA - 02-2026`, `USSA - 2025 to 2026` ou `USSA - Through 2026`.
 
@@ -190,8 +195,11 @@ Também há comandos diretos:
 # Prévia offline, sem credenciais ou internet; JSON com todas as candidatas.
 spotify-sync playlist preview --kind lsua --from 02/2026
 spotify-sync playlist preview --kind ussa --from 2025 --to 2026 --date-basis release
+spotify-sync playlist preview --kind usfa --from 02/2026
+spotify-sync playlist preview --kind usfa --from 2025 --to 2026 --include-compilations
 # Prévia e confirmação interativa.
 spotify-sync playlist create --kind lsua
+spotify-sync playlist create --kind usfa --from 2026
 # Para scripts: confirmação explícita; base incompleta exige a outra flag.
 spotify-sync playlist create --kind ussa --yes --allow-incomplete
 spotify-sync playlist status

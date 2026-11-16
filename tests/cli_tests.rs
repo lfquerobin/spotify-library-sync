@@ -139,8 +139,71 @@ fn menu_opens_without_arguments_handles_invalid_choice_and_eof() {
     assert!(text.contains("Opção inválida"));
     assert!(text.contains("Criar LSUA"));
     assert!(text.contains("Criar USSA"));
+    assert!(text.contains("13. Criar USFA"));
     assert!(text.contains("liked_tracks"));
     assert!(interactive(&path, "").status.success());
+}
+
+#[test]
+fn usfa_cli_defaults_to_release_and_menu_can_cancel_offline() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("usfa.db");
+    let output = invoke(
+        &path,
+        &["playlist", "preview", "--kind", "usfa", "--from", "02/2026"],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let preview: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(preview["name"], "USFA - 02-2026");
+    assert_eq!(preview["count"], 0);
+    assert_eq!(preview["incomplete"], true);
+    assert!(!invoke(
+        &path,
+        &[
+            "playlist",
+            "preview",
+            "--kind",
+            "usfa",
+            "--date-basis",
+            "added"
+        ]
+    )
+    .status
+    .success());
+    assert!(!invoke(
+        &path,
+        &[
+            "playlist",
+            "preview",
+            "--kind",
+            "ussa",
+            "--include-compilations"
+        ]
+    )
+    .status
+    .success());
+    assert!(invoke(
+        &path,
+        &[
+            "playlist",
+            "preview",
+            "--kind",
+            "usfa",
+            "--include-compilations"
+        ]
+    )
+    .status
+    .success());
+    let output = interactive(&path, "13\n2026\n\nn\n\n\n0\n");
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("Incluir compilações?"));
+    assert!(text.contains("USFA - 2026"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("Credenciais"));
 }
 #[tokio::test]
 async fn local_playlist_preview_and_cancelled_menu_creation_need_no_credentials() -> Result<()> {
