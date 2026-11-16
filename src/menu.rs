@@ -23,15 +23,21 @@ fn playlist_options(kind: playlist::Kind) -> Result<Option<playlist::Options>> {
     let Some(to) = read("Período final (opcional): ")? else {
         return Ok(None);
     };
-    let Some(basis) = read("Filtrar por 1=adição à biblioteca, 2=lançamento do álbum [1]: ")?
-    else {
-        return Ok(None);
+    let date_basis = if kind == playlist::Kind::Usfa {
+        println!("USFA filtra pela data de lançamento da edição do álbum.");
+        playlist::DateBasis::Release
+    } else {
+        let Some(basis) = read("Filtrar por 1=adição à biblioteca, 2=lançamento do álbum [1]: ")?
+        else {
+            return Ok(None);
+        };
+        match basis.as_str() {
+            "" | "1" => playlist::DateBasis::Added,
+            "2" => playlist::DateBasis::Release,
+            _ => bail!("Escolha 1 ou 2"),
+        }
     };
-    let date_basis = match basis.as_str() {
-        "" | "1" => playlist::DateBasis::Added,
-        "2" => playlist::DateBasis::Release,
-        _ => bail!("Escolha 1 ou 2"),
-    };
+    let include_compilations = kind == playlist::Kind::Usfa && confirm("Incluir compilações?")?;
     if kind == playlist::Kind::Ussa && date_basis == playlist::DateBasis::Added {
         println!("Será usada a data em que o álbum foi salvo.");
     }
@@ -40,6 +46,7 @@ fn playlist_options(kind: playlist::Kind) -> Result<Option<playlist::Options>> {
         from: (!from.is_empty()).then_some(from),
         to: (!to.is_empty()).then_some(to),
         date_basis,
+        include_compilations,
         name: None,
         public: false,
     };
@@ -72,7 +79,7 @@ fn sync_command(resume: bool) -> Command {
 }
 pub async fn run(config: Config) -> Result<()> {
     loop {
-        println!("\nSpotify Library Sync\nBanco: {}\n\n1. Login / autorizar biblioteca, artistas e playlists\n2. Sincronizar biblioteca\n3. Retomar sincronização da biblioteca\n4. Buscar discografias de artistas seguidos\n5. Retomar discografias\n6. Status da biblioteca e discografias\n7. Criar LSUA - Curtidas de álbuns não salvos\n8. Criar USSA - Não curtidas de álbuns salvos\n9. Retomar criação de playlist\n10. Status das playlists\n11. Estatísticas locais\n12. Listar artistas seguidos (offline)\n0. Sair",config.database.display());
+        println!("\nSpotify Library Sync\nBanco: {}\n\n1. Login / autorizar biblioteca, artistas e playlists\n2. Sincronizar biblioteca\n3. Retomar sincronização da biblioteca\n4. Buscar discografias de artistas seguidos\n5. Retomar discografias\n6. Status da biblioteca e discografias\n7. Criar LSUA - Curtidas de álbuns não salvos\n8. Criar USSA - Não curtidas de álbuns salvos\n9. Retomar criação de playlist\n10. Status das playlists\n11. Estatísticas locais\n12. Listar artistas seguidos (offline)\n13. Criar USFA - Lançamentos não curtidos de artistas seguidos\n0. Sair",config.database.display());
         let Some(choice) = read("Opção: ")? else {
             break;
         };
@@ -94,11 +101,13 @@ pub async fn run(config: Config) -> Result<()> {
                     },
                 },
                 "6" => Command::Status,
-                "7" | "8" => {
+                "7" | "8" | "13" => {
                     let Some(options) = playlist_options(if choice == "7" {
                         playlist::Kind::Lsua
-                    } else {
+                    } else if choice == "8" {
                         playlist::Kind::Ussa
+                    } else {
+                        playlist::Kind::Usfa
                     })?
                     else {
                         return Ok(None);
